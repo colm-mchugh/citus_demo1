@@ -236,60 +236,80 @@ VALUES (100, '2025-01-10', 200.00, 'Bob');
 
 # MERGE - WHEN NOT MATCHED BY SOURCE
 
-Citus 13 comes with support for `WHEN NOT MATCHED BY SOURCE`, a new type of merge action added by Postgres 17. This action is taken on rows in the target table - the table being modified by the `MERGE` - that do not have a matching row in the source relation. The target row can be updated or deleted. One way to understand this action is to consider that if the source relation is empty - has zero rows - then every row in the target must undergo the `WHEN NOT MATCHED BY SOURCE` action. Citus 13 supports this action for distributed tables, and we will demonstrate a few scenarios using this example schema:
+Citus 13 comes with support for `WHEN NOT MATCHED BY SOURCE`, a new type of merge action added by Postgres 17. This action is taken on rows in the target table - the table being modified by the `MERGE` - that do not have a matching row in the source relation. The target row can be updated or deleted. One way to understand this action is to consider that if the source relation is empty - has zero rows - then every row in the target must undergo the `WHEN NOT MATCHED BY SOURCE` action. Citus 13 supports this action for distributed tables, and we will demonstrate using a simplified but useful scenario.
 
 ```
--- create and distribute the target and source tables
-CREATE TABLE target_table (tid integer, balance float, val text);
-CREATE TABLE source_table (sid integer, delta float);
-SELECT create_distributed_table('target_table', 'tid');
-SELECT create_distributed_table('source_table', 'sid');
-
--- populate the tables
-INSERT INTO target_table SELECT id, id * 100, 'initial' FROM generate_series(1,5,2) AS id;
-INSERT INTO source_table SELECT id, id * 10 FROM generate_series(1,4) AS id;
+-- Supporting MERGE .. WHEN NOT MATCHED BY SOURCE in Citus 13
 ```
 
-## Distributed Table target - Distributed Table source
-
-Run a MERGE command against distributed table `target_table` with a `NOT MATCHED BY SOURCE` action:
+There is a distributed table called `products`, which we will use to merge into; it is the _target_ table:
 ```
-MERGE INTO target_table t
-    USING source_table s
-    ON t.tid = s.sid AND tid = 1
-    WHEN MATCHED THEN
-        UPDATE SET balance = balance + delta, val = val || ' updated by merge'
+CREATE TABLE products (p_id integer, p_name text, p_price float, p_status text);
+
+SELECT create_distributed_table('products', 'p_id');
+```
+
+Table `new_product_info` will be used as the _source_ table for the merge; it is a local citus table:
+
+```
+CREATE TABLE new_product_info(p_id integer, p_name text, p_price float);
+
+SELECT citus_add_local_table_to_metadata('new_product_info');
+```
+Populate the tables:
+```
+INSERT INTO products values
+(1, 'tea', 5, 'Initial'),
+(2, 'coffee', 8.5, 'Initial'),
+(3, 'marmalade', 8.75, 'Initial'), 
+(4, 'ginger biscuits', 9.95, 'Initial'),
+(5, 'olive oil', 12.50, 'Initial');
+
+INSERT INTO new_product_info values
+(1, 'tea', 6.5),
+(3, 'marmalade', 8.0),
+(7, 'chips', 5.5);
+```
+
+Before running the MERGE command let's take a look at the data:
+```
+select * from products order by p_id;
+select * from new_product_info  order by p_id;
+```
+
+Perform the MERGE command, and notice how the products data is changed accordingly:
+```
+MERGE INTO products t
+  USING new_product_info s
+  ON t.p_id = s.p_id
+  WHEN MATCHED AND t.p_price <> s.p_price THEN
+        UPDATE SET p_price = s.p_price,
+                   p_status =  'Updated by new product info'
     WHEN NOT MATCHED BY TARGET THEN
-        INSERT VALUES (sid, delta, 'inserted by merge')
-    WHEN NOT MATCHED BY SOURCE THEN
-        UPDATE SET val = val || ' not matched by source';
+        INSERT VALUES (s.p_id, s.p_name, s.p_price, 'New product')
+  WHEN NOT MATCHED BY SOURCE THEN
+    UPDATE SET p_status =  'No New Product Info';
+
+select * from products order by p_id;
 ```
 
-Let's see the distributed target table after having run the `MERGE` command; the rows in the target table that did not have a matching row in the source have been updated by the `NOT MATCHED BY SOURCE` action.
-
+Look at the query plan for the MERGE:
 ```
-SELECT * FROM target_table ORDER BY tid;
-
- tid | balance |              val
------+---------+-------------------------------
-   1 |     110 | initial updated by merge
-   2 |      20 | inserted by merge
-   3 |      30 | inserted by merge
-   3 |     300 | initial not matched by source
-   4 |      40 | inserted by merge
-   5 |     500 | initial not matched by source
+EXPLAIN (VERBOSE)
+MERGE INTO products t
+  USING new_product_info s
+  ON t.p_id = s.p_id
+  WHEN MATCHED AND t.p_price <> s.p_price THEN
+        UPDATE SET p_price = s.p_price,
+                   p_status =  'Updated by new product info'
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT VALUES (s.p_id, s.p_name, s.p_price, 'New product')
+  WHEN NOT MATCHED BY SOURCE THEN
+    UPDATE SET p_status =  'No New Product Info';
 ```
 
-## Distributed Table target - Reference table source
-
-A distributed table can undergo a `MERGE` with a reference table as a source - todo add query example
-
-## Distributed Table target - local table source
-
-A distributed table can undergo a `MERGE` with a local or vanilla Postgres table as a source - todo add query example
-  
-## Distributed Table target - Distributed Query source
-
-A distributed table can undergo a `MERGE` with an arbitrary distributed query as a source - todo add query example
-
-#### todo - add more realistic/compelling examples - see https://www.citusdata.com/blog/2023/07/27/how-citus-12-supports-postgres-merge/
+Clean up:
+```
+drop table products;
+drop table new_product_info;
+```
